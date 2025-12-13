@@ -1,10 +1,17 @@
 require('dotenv').config();
-require('./mqtt/client');
+
+// 🔹 MQTT: load safely (won’t crash Render if broker not reachable)
+try {
+  require('./mqtt/client');
+} catch (e) {
+  console.warn('⚠️ MQTT disabled:', e.message);
+}
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const path = require('path');
 const jwt = require('jsonwebtoken');
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const { db, init } = require('./db');
@@ -14,12 +21,21 @@ const { publish } = require('./mqtt/client');
 
 init();
 const app = express();
+
+/* =====================
+   MIDDLEWARE
+===================== */
+app.use(cors({
+  origin: '*',           // allow Vercel frontend
+  methods: ['GET','POST'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+
 app.use(bodyParser.json());
 
-// Serve static frontend from /public
-app.use(express.static(path.join(__dirname, 'public')));
-
-// 🔐 Admin credentials
+/* =====================
+   ADMIN CONFIG
+===================== */
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@pasafe.local';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-admin-secret';
@@ -28,9 +44,9 @@ function signAdmin(email) {
   return jwt.sign({ role: 'admin', email }, JWT_SECRET, { expiresIn: '6h' });
 }
 
-// =====================
-// UTIL
-// =====================
+/* =====================
+   UTIL
+===================== */
 const lastEvent = {};
 function debounce(key, windowMs = 5000) {
   const now = Date.now();
@@ -39,12 +55,13 @@ function debounce(key, windowMs = 5000) {
   return true;
 }
 
-// =====================
-// USERS
-// =====================
+/* =====================
+   USERS
+===================== */
 app.post('/v1/users/register', (req, res) => {
   const { name, phone, emergency_contacts } = req.body;
-  if (!name || !phone) return res.status(400).json({ error: 'name & phone required' });
+  if (!name || !phone)
+    return res.status(400).json({ error: 'name & phone required' });
 
   const id = uuidv4();
   db.run(
@@ -58,12 +75,13 @@ app.post('/v1/users/register', (req, res) => {
   );
 });
 
-// =====================
-// DEVICE REGISTER
-// =====================
+/* =====================
+   DEVICE REGISTER
+===================== */
 app.post('/v1/devices/register', (req, res) => {
   const { hw_serial, owner_id } = req.body;
-  if (!hw_serial) return res.status(400).json({ error: 'hw_serial required' });
+  if (!hw_serial)
+    return res.status(400).json({ error: 'hw_serial required' });
 
   const id = uuidv4();
   db.run(
@@ -77,9 +95,9 @@ app.post('/v1/devices/register', (req, res) => {
   );
 });
 
-// =====================
-// READINGS (HTTP INGEST)
-// =====================
+/* =====================
+   READINGS (HTTP INGEST)
+===================== */
 app.post('/v1/readings', deviceAuthMiddleware, (req, res) => {
   const device_id = req.deviceId;
   const { ts, type, value, raw, lat, lon, acc } = req.body;
@@ -107,7 +125,7 @@ app.post('/v1/readings', deviceAuthMiddleware, (req, res) => {
       const threshold = parseFloat(process.env.ALCOHOL_THRESHOLD || 0.2);
 
       if (type === 'alcohol' && parseFloat(value) >= threshold) {
-        if (!debounce(`${device_id}:alcohol`, 8000)) return;
+        if (!debounce(`${device_id}:alcohol`, 8000)) return res.json({ ok: true });
 
         const alertId = uuidv4();
         db.run(
@@ -120,7 +138,7 @@ app.post('/v1/readings', deviceAuthMiddleware, (req, res) => {
           lat, lon, type: 'alcohol_alert', device_id
         });
 
-        publish(`devices/${device_id}/commands`, {
+        publish?.(`devices/${device_id}/commands`, {
           id: uuidv4(),
           cmd: 'lock_engine',
           reason: 'alcohol_detected'
@@ -132,9 +150,9 @@ app.post('/v1/readings', deviceAuthMiddleware, (req, res) => {
   );
 });
 
-// =====================
-// BLE TRIGGER
-// =====================
+/* =====================
+   BLE TRIGGER
+===================== */
 app.post('/v1/ble/trigger', (req, res) => {
   const { device_id, type, lat, lon } = req.body;
   if (!device_id || !type)
@@ -150,7 +168,7 @@ app.post('/v1/ble/trigger', (req, res) => {
     err => {
       if (err) return res.status(500).json({ error: 'db error' });
 
-      publish(`devices/${device_id}/commands`, {
+      publish?.(`devices/${device_id}/commands`, {
         id: uuidv4(),
         cmd: 'siren',
         reason: `ble_${type}`
@@ -161,9 +179,9 @@ app.post('/v1/ble/trigger', (req, res) => {
   );
 });
 
-// =====================
-// FRONTEND APIs
-// =====================
+/* =====================
+   FRONTEND APIs
+===================== */
 app.get('/api/alerts', (req, res) => {
   db.all(`SELECT * FROM alerts ORDER BY created_at DESC LIMIT 100`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: 'db error' });
@@ -179,17 +197,14 @@ app.get('/api/readings/latest/:deviceId', (req, res) => {
       if (err) return res.status(500).json({ error: 'db error' });
       if (!row) return res.json(null);
 
-      res.json({
-        ...row,
-        raw: row.raw ? JSON.parse(row.raw) : {}
-      });
+      res.json({ ...row, raw: row.raw ? JSON.parse(row.raw) : {} });
     }
   );
 });
 
-// =====================
-// ADMIN
-// =====================
+/* =====================
+   ADMIN
+===================== */
 app.post('/api/admin/login', (req, res) => {
   const { email, password } = req.body || {};
   if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD)
@@ -207,7 +222,10 @@ app.get('/api/admin/me', (req, res) => {
   }
 });
 
-// =====================
+/* =====================
+   START SERVER
+===================== */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server running on', PORT));
-
+app.listen(PORT, () => {
+  console.log('🚀 Server running on', PORT);
+});
