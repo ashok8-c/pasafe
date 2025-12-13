@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: pa_safe_mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    restart: unless-stopped
+
+  backend:
+    build: .
+    container_name: pa_safe_backend
+    command: npm start
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - MQTT_BROKER=mqtt://mosquitto:1883
+      - JWT_SECRET=please_change_this
+      - ALCOHOL_THRESHOLD=0.2
+    depends_on:
+      - mosquitto
+    volumes:
+      - ./:/usr/src/app
+    restart: unless-stopped
