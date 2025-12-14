@@ -1,36 +1,41 @@
 require('dotenv').config();
 
-// 🔹 MQTT: load safely (won’t crash Render if broker not reachable)
+// 🔹 MQTT: safe load (won’t crash Render)
+let publish = null;
 try {
-  require('./mqtt/client');
+  ({ publish } = require('./mqtt/client'));
 } catch (e) {
   console.warn('⚠️ MQTT disabled:', e.message);
 }
 
 const express = require('express');
 const bodyParser = require('body-parser');
-const path = require('path');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
-const { db, init } = require('./db');
+const { init, getDb } = require('./db');
 const { signDevice, deviceAuthMiddleware } = require('./auth');
 const notifications = require('./services/notifications');
-const { publish } = require('./mqtt/client');
 
-init();
 const app = express();
+
+/* =====================
+   INIT DB
+===================== */
+init().catch(err => {
+  console.error('❌ MongoDB init failed', err);
+  process.exit(1);
+});
 
 /* =====================
    MIDDLEWARE
 ===================== */
 app.use(cors({
-  origin: '*',           // allow Vercel frontend
+  origin: '*',
   methods: ['GET','POST'],
   allowedHeaders: ['Content-Type','Authorization']
 }));
-
 app.use(bodyParser.json());
 
 /* =====================
@@ -45,161 +50,185 @@ function signAdmin(email) {
 }
 
 /* =====================
-   UTIL
-===================== */
-const lastEvent = {};
-function debounce(key, windowMs = 5000) {
-  const now = Date.now();
-  if (lastEvent[key] && now - lastEvent[key] < windowMs) return false;
-  lastEvent[key] = now;
-  return true;
-}
-
-/* =====================
    USERS
 ===================== */
-app.post('/v1/users/register', (req, res) => {
-  const { name, phone, emergency_contacts } = req.body;
-  if (!name || !phone)
-    return res.status(400).json({ error: 'name & phone required' });
+app.post('/v1/users/register', async (req, res) => {
+  try {
+    const { name, phone, emergency_contacts } = req.body;
+    if (!name || !phone)
+      return res.status(400).json({ error: 'name & phone required' });
 
-  const id = uuidv4();
-  db.run(
-    `INSERT INTO users(id, name, phone, emergency_contacts, identity_card_id)
-     VALUES (?,?,?,?,?)`,
-    [id, name, phone, JSON.stringify(emergency_contacts || []), `ID-${id.slice(0, 8)}`],
-    err => {
-      if (err) return res.status(500).json({ error: 'db error' });
-      res.json({ ok: true, user_id: id });
-    }
-  );
+    const db = getDb();
+    const user = {
+      id: uuidv4(),
+      name,
+      phone,
+      emergency_contacts: emergency_contacts || [],
+      identity_card_id: `ID-${Date.now()}`
+    };
+
+    await db.collection('users').insertOne(user);
+    res.json({ ok: true, user_id: user.id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
 /* =====================
    DEVICE REGISTER
 ===================== */
-app.post('/v1/devices/register', (req, res) => {
-  const { hw_serial, owner_id } = req.body;
-  if (!hw_serial)
-    return res.status(400).json({ error: 'hw_serial required' });
+app.post('/v1/devices/register', async (req, res) => {
+  try {
+    const { hw_serial, owner_id } = req.body;
+    if (!hw_serial)
+      return res.status(400).json({ error: 'hw_serial required' });
 
-  const id = uuidv4();
-  db.run(
-    `INSERT INTO devices(id, owner_id, hw_serial, last_seen, status)
-     VALUES (?,?,?,?,?)`,
-    [id, owner_id || null, hw_serial, Date.now(), 'active'],
-    err => {
-      if (err) return res.status(500).json({ error: 'db error' });
-      res.json({ device_id: id, token: signDevice(id) });
-    }
-  );
+    const db = getDb();
+    const device = {
+      id: uuidv4(),
+      owner_id: owner_id || null,
+      hw_serial,
+      last_seen: Date.now(),
+      status: 'active'
+    };
+
+    await db.collection('devices').insertOne(device);
+    res.json({ device_id: device.id, token: signDevice(device.id) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
 /* =====================
    READINGS (HTTP INGEST)
 ===================== */
-app.post('/v1/readings', deviceAuthMiddleware, (req, res) => {
-  const device_id = req.deviceId;
-  const { ts, type, value, raw, lat, lon, acc } = req.body;
+app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
+  try {
+    const db = getDb();
+    const device_id = req.deviceId;
+    const { ts, type, value, raw, lat, lon, acc } = req.body;
 
-  const id = uuidv4();
-  const timestamp = ts || Date.now();
-
-  db.run(
-    `INSERT INTO readings(id, device_id, type, value, raw, lat, lon, acc, ts)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [
-      id,
+    const reading = {
+      id: uuidv4(),
       device_id,
       type,
-      value || null,
-      JSON.stringify(raw || {}),
-      lat || null,
-      lon || null,
-      acc || null,
-      timestamp,
-    ],
-    err => {
-      if (err) return res.status(500).json({ error: 'db error' });
+      value: value ?? null,
+      raw: raw || {},
+      lat: lat ?? null,
+      lon: lon ?? null,
+      acc: acc ?? null,
+      ts: ts || Date.now()
+    };
 
-      const threshold = parseFloat(process.env.ALCOHOL_THRESHOLD || 0.2);
+    await db.collection('readings').insertOne(reading);
 
-      if (type === 'alcohol' && parseFloat(value) >= threshold) {
-        if (!debounce(`${device_id}:alcohol`, 8000)) return res.json({ ok: true });
+    const threshold = parseFloat(process.env.ALCOHOL_THRESHOLD || 0.2);
 
-        const alertId = uuidv4();
-        db.run(
-          `INSERT INTO alerts(id, device_id, user_id, type, value, lat, lon, status, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)`,
-          [alertId, device_id, null, 'alcohol_alert', value, lat, lon, 'pending', Date.now()]
-        );
+    if (type === 'alcohol' && parseFloat(value) >= threshold) {
+      const alert = {
+        id: uuidv4(),
+        device_id,
+        user_id: null,
+        type: 'alcohol_alert',
+        value,
+        lat,
+        lon,
+        status: 'pending',
+        created_at: Date.now()
+      };
 
-        notifications?.notifyNearbyEmergency?.({
-          lat, lon, type: 'alcohol_alert', device_id
-        });
+      await db.collection('alerts').insertOne(alert);
 
-        publish?.(`devices/${device_id}/commands`, {
-          id: uuidv4(),
-          cmd: 'lock_engine',
-          reason: 'alcohol_detected'
-        });
-      }
+      notifications?.notifyNearbyEmergency?.({
+        lat, lon, type: 'alcohol_alert', device_id
+      });
 
-      res.json({ ok: true, reading_id: id });
+      publish?.(`devices/${device_id}/commands`, {
+        id: uuidv4(),
+        cmd: 'lock_engine',
+        reason: 'alcohol_detected'
+      });
     }
-  );
+
+    res.json({ ok: true, reading_id: reading.id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
 /* =====================
    BLE TRIGGER
 ===================== */
-app.post('/v1/ble/trigger', (req, res) => {
-  const { device_id, type, lat, lon } = req.body;
-  if (!device_id || !type)
-    return res.status(400).json({ error: 'device_id & type required' });
+app.post('/v1/ble/trigger', async (req, res) => {
+  try {
+    const { device_id, type, lat, lon } = req.body;
+    if (!device_id || !type)
+      return res.status(400).json({ error: 'device_id & type required' });
 
-  const id = uuidv4();
-  const ts = Date.now();
+    const db = getDb();
+    const alert = {
+      id: uuidv4(),
+      device_id,
+      user_id: null,
+      type: `ble_${type}`,
+      value: null,
+      lat,
+      lon,
+      status: 'pending',
+      created_at: Date.now()
+    };
 
-  db.run(
-    `INSERT INTO alerts(id, device_id, user_id, type, value, lat, lon, status, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [id, device_id, null, `ble_${type}`, null, lat, lon, 'pending', ts],
-    err => {
-      if (err) return res.status(500).json({ error: 'db error' });
+    await db.collection('alerts').insertOne(alert);
 
-      publish?.(`devices/${device_id}/commands`, {
-        id: uuidv4(),
-        cmd: 'siren',
-        reason: `ble_${type}`
-      });
+    publish?.(`devices/${device_id}/commands`, {
+      id: uuidv4(),
+      cmd: 'siren',
+      reason: `ble_${type}`
+    });
 
-      res.json({ ok: true, alert_id: id });
-    }
-  );
+    res.json({ ok: true, alert_id: alert.id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
 /* =====================
    FRONTEND APIs
 ===================== */
-app.get('/api/alerts', (req, res) => {
-  db.all(`SELECT * FROM alerts ORDER BY created_at DESC LIMIT 100`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'db error' });
-    res.json(rows || []);
-  });
+app.get('/api/alerts', async (req, res) => {
+  try {
+    const db = getDb();
+    const alerts = await db
+      .collection('alerts')
+      .find({})
+      .sort({ created_at: -1 })
+      .limit(100)
+      .toArray();
+
+    res.json(alerts);
+  } catch (e) {
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
-app.get('/api/readings/latest/:deviceId', (req, res) => {
-  db.get(
-    `SELECT * FROM readings WHERE device_id = ? ORDER BY ts DESC LIMIT 1`,
-    [req.params.deviceId],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'db error' });
-      if (!row) return res.json(null);
+app.get('/api/readings/latest/:deviceId', async (req, res) => {
+  try {
+    const db = getDb();
+    const row = await db
+      .collection('readings')
+      .find({ device_id: req.params.deviceId })
+      .sort({ ts: -1 })
+      .limit(1)
+      .next();
 
-      res.json({ ...row, raw: row.raw ? JSON.parse(row.raw) : {} });
-    }
-  );
+    res.json(row || null);
+  } catch (e) {
+    res.status(500).json({ error: 'db error' });
+  }
 });
 
 /* =====================
@@ -213,19 +242,11 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token: signAdmin(email) });
 });
 
-app.get('/api/admin/me', (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    res.json({ ok: true, admin: jwt.verify(token, JWT_SECRET) });
-  } catch {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-});
-
 /* =====================
    START SERVER
 ===================== */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('🚀 Server running on', PORT);
+  console.log('🚀 PASAFE server running on', PORT);
 });
+
