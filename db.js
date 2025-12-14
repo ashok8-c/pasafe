@@ -1,88 +1,48 @@
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { MongoClient } = require("mongodb");
 
-const dbFile = path.join(__dirname, 'pa_safe.db');
-const db = new sqlite3.Database(dbFile);
+const MONGO_URI = process.env.MONGO_URI;
+const DB_NAME = "pasafe";
 
-function init() {
-  db.serialize(() => {
-    db.run('PRAGMA foreign_keys = ON');
+let client;
+let db;
 
-    db.run(`
-      CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        name TEXT,
-        phone TEXT,
-        emergency_contacts TEXT,
-        identity_card_id TEXT
-      )
-    `);
+async function init() {
+  if (db) return db;
 
-    db.run(`
-      CREATE TABLE IF NOT EXISTS devices (
-        id TEXT PRIMARY KEY,
-        owner_id TEXT,
-        hw_serial TEXT UNIQUE,
-        public_key TEXT,
-        last_seen INTEGER,
-        status TEXT,
-        FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE SET NULL
-      )
-    `);
+  client = new MongoClient(MONGO_URI);
+  await client.connect();
 
-    db.run(`
-      CREATE TABLE IF NOT EXISTS readings (
-        id TEXT PRIMARY KEY,
-        device_id TEXT,
-        type TEXT,
-        value REAL,
-        raw TEXT,
-        lat REAL,
-        lon REAL,
-        acc REAL,
-        ts INTEGER,
-        FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE
-      )
-    `);
+  db = client.db(DB_NAME);
 
-    db.run(`
-      CREATE TABLE IF NOT EXISTS alerts (
-        id TEXT PRIMARY KEY,
-        device_id TEXT,
-        user_id TEXT,
-        type TEXT,
-        value REAL,
-        lat REAL,
-        lon REAL,
-        status TEXT,
-        created_at INTEGER,
-        FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE,
-        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
-      )
-    `);
+  // Create collections (safe if already exist)
+  await Promise.all([
+    db.createCollection("users").catch(() => {}),
+    db.createCollection("devices").catch(() => {}),
+    db.createCollection("readings").catch(() => {}),
+    db.createCollection("alerts").catch(() => {}),
+    db.createCollection("commands").catch(() => {})
+  ]);
 
-    db.run(`
-      CREATE TABLE IF NOT EXISTS commands (
-        id TEXT PRIMARY KEY,
-        device_id TEXT,
-        command TEXT,
-        payload TEXT,
-        status TEXT,
-        created_at INTEGER,
-        FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE
-      )
-    `);
+  // Indexes (same purpose as SQLite indexes)
+  await db.collection("readings").createIndex(
+    { device_id: 1, ts: -1 }
+  );
 
-    db.run(
-      `CREATE INDEX IF NOT EXISTS idx_readings_device_ts
-       ON readings(device_id, ts)`
-    );
+  await db.collection("alerts").createIndex(
+    { device_id: 1, created_at: -1 }
+  );
 
-    db.run(
-      `CREATE INDEX IF NOT EXISTS idx_alerts_device_created
-       ON alerts(device_id, created_at)`
-    );
-  });
+  console.log("✅ MongoDB initialized successfully");
+  return db;
 }
 
-module.exports = { db, init };
+function getDb() {
+  if (!db) throw new Error("Database not initialized");
+  return db;
+}
+
+module.exports = {
+  init,
+  getDb
+};
+
