@@ -1,6 +1,8 @@
 require('dotenv').config();
 
-// 🔹 MQTT: safe load (won’t crash Render)
+/* =====================
+   SAFE MQTT LOAD
+===================== */
 let publish = null;
 try {
   ({ publish } = require('./mqtt/client'));
@@ -21,21 +23,24 @@ const notifications = require('./services/notifications');
 const app = express();
 
 /* =====================
-   INIT DB
+   INIT DATABASE
 ===================== */
-init().catch(err => {
-  console.error('❌ MongoDB init failed', err);
-  process.exit(1);
-});
+init()
+  .then(() => console.log('✅ MongoDB initialized successfully'))
+  .catch(err => {
+    console.error('❌ MongoDB init failed', err);
+    process.exit(1);
+  });
 
 /* =====================
    MIDDLEWARE
 ===================== */
 app.use(cors({
   origin: '*',
-  methods: ['GET','POST'],
-  allowedHeaders: ['Content-Type','Authorization']
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(bodyParser.json());
 
 /* =====================
@@ -43,7 +48,7 @@ app.use(bodyParser.json());
 ===================== */
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@pasafe.local';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-admin-secret';
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
 function signAdmin(email) {
   return jwt.sign({ role: 'admin', email }, JWT_SECRET, { expiresIn: '6h' });
@@ -102,7 +107,7 @@ app.post('/v1/devices/register', async (req, res) => {
 });
 
 /* =====================
-   READINGS (HTTP INGEST)
+   READINGS (DEVICE DATA)
 ===================== */
 app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
   try {
@@ -124,8 +129,8 @@ app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
 
     await db.collection('readings').insertOne(reading);
 
+    /* ---- Alcohol Detection ---- */
     const threshold = parseFloat(process.env.ALCOHOL_THRESHOLD || 0.2);
-
     if (type === 'alcohol' && parseFloat(value) >= threshold) {
       const alert = {
         id: uuidv4(),
@@ -160,7 +165,7 @@ app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
 });
 
 /* =====================
-   BLE TRIGGER
+   BLE EMERGENCY TRIGGER
 ===================== */
 app.post('/v1/ble/trigger', async (req, res) => {
   try {
@@ -210,7 +215,7 @@ app.get('/api/alerts', async (req, res) => {
       .toArray();
 
     res.json(alerts);
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: 'db error' });
   }
 });
@@ -226,8 +231,41 @@ app.get('/api/readings/latest/:deviceId', async (req, res) => {
       .next();
 
     res.json(row || null);
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: 'db error' });
+  }
+});
+
+/* =====================
+   🚨 MANUAL NOTIFY API (DEMO CORE)
+===================== */
+app.post('/api/notify', async (req, res) => {
+  try {
+    const { alert_id, authority } = req.body;
+
+    if (!alert_id || !authority)
+      return res.status(400).json({
+        error: 'alert_id and authority required'
+      });
+
+    const db = getDb();
+    await db.collection('notifications').insertOne({
+      id: uuidv4(),
+      alert_id,
+      authority,
+      notified_at: new Date(),
+      mode: 'manual-demo'
+    });
+
+    console.log(`📢 ${authority.toUpperCase()} notified for alert ${alert_id}`);
+
+    res.json({
+      ok: true,
+      message: `${authority.toUpperCase()} notified successfully`
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'notification failed' });
   }
 });
 
@@ -249,4 +287,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('🚀 PASAFE server running on', PORT);
 });
-
