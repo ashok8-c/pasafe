@@ -74,8 +74,7 @@ app.post('/v1/users/register', async (req, res) => {
 
     await db.collection('users').insertOne(user);
     res.json({ ok: true, user_id: user.id });
-  } catch (e) {
-    console.error(e);
+  } catch {
     res.status(500).json({ error: 'db error' });
   }
 });
@@ -100,8 +99,7 @@ app.post('/v1/devices/register', async (req, res) => {
 
     await db.collection('devices').insertOne(device);
     res.json({ device_id: device.id, token: signDevice(device.id) });
-  } catch (e) {
-    console.error(e);
+  } catch {
     res.status(500).json({ error: 'db error' });
   }
 });
@@ -115,7 +113,7 @@ app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
     const device_id = req.deviceId;
     const { ts, type, value, raw, lat, lon, acc } = req.body;
 
-    const reading = {
+    await db.collection('readings').insertOne({
       id: uuidv4(),
       device_id,
       type,
@@ -125,18 +123,18 @@ app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
       lon: lon ?? null,
       acc: acc ?? null,
       ts: ts || Date.now()
-    };
-
-    await db.collection('readings').insertOne(reading);
+    });
 
     /* ---- Alcohol Detection ---- */
     const threshold = parseFloat(process.env.ALCOHOL_THRESHOLD || 0.2);
+
     if (type === 'alcohol' && parseFloat(value) >= threshold) {
       const alert = {
         id: uuidv4(),
         device_id,
         user_id: null,
         type: 'alcohol_alert',
+        category: 'alcohol',        // ✅ IMPORTANT
         value,
         lat,
         lon,
@@ -157,9 +155,8 @@ app.post('/v1/readings', deviceAuthMiddleware, async (req, res) => {
       });
     }
 
-    res.json({ ok: true, reading_id: reading.id });
-  } catch (e) {
-    console.error(e);
+    res.json({ ok: true });
+  } catch {
     res.status(500).json({ error: 'db error' });
   }
 });
@@ -174,19 +171,18 @@ app.post('/v1/ble/trigger', async (req, res) => {
       return res.status(400).json({ error: 'device_id & type required' });
 
     const db = getDb();
-    const alert = {
+    await db.collection('alerts').insertOne({
       id: uuidv4(),
       device_id,
       user_id: null,
       type: `ble_${type}`,
+      category: 'accident',        // ✅ IMPORTANT
       value: null,
       lat,
       lon,
       status: 'pending',
       created_at: Date.now()
-    };
-
-    await db.collection('alerts').insertOne(alert);
+    });
 
     publish?.(`devices/${device_id}/commands`, {
       id: uuidv4(),
@@ -194,9 +190,8 @@ app.post('/v1/ble/trigger', async (req, res) => {
       reason: `ble_${type}`
     });
 
-    res.json({ ok: true, alert_id: alert.id });
-  } catch (e) {
-    console.error(e);
+    res.json({ ok: true });
+  } catch {
     res.status(500).json({ error: 'db error' });
   }
 });
@@ -207,9 +202,15 @@ app.post('/v1/ble/trigger', async (req, res) => {
 app.get('/api/alerts', async (req, res) => {
   try {
     const db = getDb();
+    const { type } = req.query;
+
+    const filter = {};
+    if (type === 'alcohol') filter.category = 'alcohol';
+    if (type === 'accident') filter.category = 'accident';
+
     const alerts = await db
       .collection('alerts')
-      .find({})
+      .find(filter)
       .sort({ created_at: -1 })
       .limit(100)
       .toArray();
@@ -217,55 +218,6 @@ app.get('/api/alerts', async (req, res) => {
     res.json(alerts);
   } catch {
     res.status(500).json({ error: 'db error' });
-  }
-});
-
-app.get('/api/readings/latest/:deviceId', async (req, res) => {
-  try {
-    const db = getDb();
-    const row = await db
-      .collection('readings')
-      .find({ device_id: req.params.deviceId })
-      .sort({ ts: -1 })
-      .limit(1)
-      .next();
-
-    res.json(row || null);
-  } catch {
-    res.status(500).json({ error: 'db error' });
-  }
-});
-
-/* =====================
-   🚨 MANUAL NOTIFY API (DEMO CORE)
-===================== */
-app.post('/api/notify', async (req, res) => {
-  try {
-    const { alert_id, authority } = req.body;
-
-    if (!alert_id || !authority)
-      return res.status(400).json({
-        error: 'alert_id and authority required'
-      });
-
-    const db = getDb();
-    await db.collection('notifications').insertOne({
-      id: uuidv4(),
-      alert_id,
-      authority,
-      notified_at: new Date(),
-      mode: 'manual-demo'
-    });
-
-    console.log(`📢 ${authority.toUpperCase()} notified for alert ${alert_id}`);
-
-    res.json({
-      ok: true,
-      message: `${authority.toUpperCase()} notified successfully`
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'notification failed' });
   }
 });
 
